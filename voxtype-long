@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""Keep one voxtype start request alive while the daemon transcribes."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+ACTIVE = {"recording", "streaming"}
+ACK_TIMEOUT = 3.0
+QUEUE_TIMEOUT = 3600.0
+
+
+class Error(RuntimeError):
+    pass
+
+
+def runtime() -> Path:
+    return Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+
+
+def helper_dir() -> Path:
+    return runtime() / "voxtype-long"
+
+
+def stock_dir() -> Path:
+    return runtime() / "voxtype"
+
+
+def native_state() -> str:
+    try:
+        state = (stock_dir() / "state").read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return "unknown"
+    return state or "unknown"
+
+
+@contextmanager
+def locked():
+    """Protect state transitions and native commands, never the queue wait."""
+
+    directory = helper_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (directory / "lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def read_doc() -> dict:
+    path = helper_dir() / "request.json"
+    if not path.exists():
+        return {"next_token": 1, "request": None}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise Error(f"cannot read helper state: {exc}") from exc
+    request = document.get("request") if isinstance(document, dict) else None
+    valid_request = request is None or (
+        isinstance(request, dict)
+        and all(isinstance(request.get(key), int) for key in ("token", "pid"))
+        and request.get("phase") in {"queued", "starting"}
+    )
+    if (
+        not isinstance(document, dict)
+        or not isinstance(document.get("next_token"), int)
+        or not valid_request
+    ):
+        raise Error(f"invalid helper state in {path}")
+    return document
+
+
+def write_doc(document: dict) -> None:
+    directory = helper_dir()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".request.", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(document, output, separators=(",", ":"))
+            output.write("\n")
+        os.replace(temporary, directory / "request.json")
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def clear_doc(document: dict) -> None:
+    document["request"] = None
+    write_doc(document)
+
+
+def pid_alive(pid: object) -> bool:
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def daemon_status() -> bool | None:
+    found = False
+    for path in (stock_dir() / "voxtype.lock", stock_dir() / "pid"):
+        try:
+            pid = int(path.read_text(encoding="utf-8").strip())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            found = True
+            continue
+        found = True
+        if pid > 1 and pid_alive(pid):
+            return True
+    return False if found else None
+
+
+def require_daemon() -> None:
+    if daemon_status() is False:
+        raise Error("voxtype daemon is not running; start voxtype first")
+
+
+def native(*args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            [os.environ.get("VOXTYPE_LONG_NATIVE", "voxtype"), *args],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise Error(f"could not run voxtype: {exc}") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise Error(detail or f"voxtype exited with status {result.returncode}")
+    return result
+
+
+def notify(title: str, message: str) -> None:
+    if os.environ.get("VOXTYPE_LONG_NOTIFY") == "0":
+        return
+    program = shutil.which("notify-send")
+    if not program:
+        return
+    try:
+        subprocess.run(
+            [program, "-a", "voxtype-long", title, message],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def limit(name: str, default: float, maximum: float) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return min(value, maximum) if math.isfinite(value) and value > 0 else default
+
+
+def pending(document: dict) -> dict:
+    token = document["next_token"]
+    document["next_token"] = token + 1
+    request = {"token": token, "pid": os.getpid(), "phase": "queued"}
+    document["request"] = request
+    write_doc(document)
+    return request
+
+
+def request_for(document: dict, token: int) -> dict | None:
+    request = document.get("request")
+    return request if request and request.get("token") == token else None
+
+
+def drop_dead_request(document: dict) -> dict | None:
+    request = document.get("request")
+    if request and request.get("phase") == "queued" and not pid_alive(request.get("pid")):
+        clear_doc(document)
+        return None
+    return request
+
+
+def start_ack_locked(document: dict, token: int) -> bool:
+    """Send start and wait for recording while the transition lock is held."""
+
+    request = request_for(document, token)
+    if request is None or not pid_alive(request.get("pid")):
+        if request is not None:
+            clear_doc(document)
+        return False
+    state = native_state()
+    if state in ACTIVE:
+        clear_doc(document)
+        print("dictation is already recording")
+        return False
+    if state == "transcribing":
+        return False
+    request["phase"] = "starting"
+    write_doc(document)
+    try:
+        native("record", "start")
+        deadline = time.monotonic() + limit("VOXTYPE_LONG_ACK_TIMEOUT", ACK_TIMEOUT, 15)
+        while time.monotonic() < deadline:
+            if native_state() in ACTIVE:
+                clear_doc(document)
+                print("dictation started")
+                return True
+            time.sleep(0.05)
+    except Error:
+        clear_doc(document)
+        raise
+    raise Error("voxtype did not acknowledge the start before timeout")
+
+
+def start_request_locked(document: dict, state: str) -> int | None:
+    if state == "transcribing":
+        if daemon_status() is not True:
+            raise Error("voxtype daemon disappeared while it was transcribing")
+    else:
+        require_daemon()
+    request = pending(document)
+    if state == "transcribing" or not start_ack_locked(document, request["token"]):
+        return request["token"]
+    return None
+
+
+def wait_for_idle(token: int) -> int:
+    deadline = time.monotonic() + limit("VOXTYPE_LONG_QUEUE_TIMEOUT", QUEUE_TIMEOUT, 3600)
+    while time.monotonic() < deadline:
+        document = read_doc()
+        if request_for(document, token) is None:
+            return 0
+        state = native_state()
+        if state == "idle":
+            with locked():
+                document = read_doc()
+                request = request_for(document, token)
+                if request is None:
+                    return 0
+                if not pid_alive(request.get("pid")):
+                    clear_doc(document)
+                    return 0
+                if native_state() == "idle":
+                    if start_ack_locked(document, token):
+                        return 0
+        elif state in ACTIVE:
+            with locked():
+                document = read_doc()
+                if request_for(document, token) is not None:
+                    clear_doc(document)
+            return 0
+        elif daemon_status() is not True:
+            with locked():
+                document = read_doc()
+                if request_for(document, token) is not None:
+                    clear_doc(document)
+            raise Error("voxtype daemon disappeared while it was transcribing")
+        time.sleep(0.05)
+    with locked():
+        document = read_doc()
+        if request_for(document, token) is not None:
+            clear_doc(document)
+    notify("dictation timed out", "voxtype stayed busy too long; try again.")
+    raise Error("voxtype stayed busy too long")
+
+
+def new_start() -> int:
+    with locked():
+        document = read_doc()
+        request = drop_dead_request(document)
+        state = native_state()
+        if request is not None:
+            if state in ACTIVE:
+                clear_doc(document)
+                print("dictation is already recording")
+            else:
+                print("dictation is already queued")
+            return 0
+        if state in ACTIVE:
+            print("dictation is already recording")
+            return 0
+        queued = start_request_locked(document, state)
+    if queued is not None:
+        print("dictation queued; wait for the mic indicator before speaking")
+        notify("dictation queued", "voxtype is transcribing. wait for the mic indicator before speaking.")
+        return wait_for_idle(queued)
+    return 0
+
+
+def wait_after_stop_locked(cancel: bool) -> None:
+    deadline = time.monotonic() + limit("VOXTYPE_LONG_ACK_TIMEOUT", ACK_TIMEOUT, 15)
+    while time.monotonic() < deadline:
+        state = native_state()
+        if (cancel and state == "idle") or (not cancel and state in {"idle", "transcribing"}):
+            return
+        time.sleep(0.05)
+    wanted = "idle" if cancel else "a non-recording state"
+    raise Error(f"voxtype did not reach {wanted} after {('cancel' if cancel else 'stop')}")
+
+
+def stop_locked(document: dict, request: dict | None, state: str, cancel: bool) -> None:
+    if request is not None and request.get("phase") == "queued" and state not in ACTIVE:
+        clear_doc(document)
+        print("queued dictation canceled")
+        return
+    action = "cancel" if cancel or state not in ACTIVE else "stop"
+    needs_action = (
+        request is not None and request.get("phase") == "starting"
+    ) or state in ACTIVE or (cancel and state == "transcribing")
+    if needs_action:
+        try:
+            require_daemon()
+            native("record", action)
+            wait_after_stop_locked(action == "cancel")
+        finally:
+            if request is not None and request_for(document, request["token"]):
+                clear_doc(document)
+        print("dictation canceled" if action == "cancel" else "dictation stopped")
+
+
+def stop(cancel: bool = False) -> int:
+    with locked():
+        document = read_doc()
+        stop_locked(document, drop_dead_request(document), native_state(), cancel)
+    return 0
+
+
+def toggle() -> int:
+    queued = None
+    with locked():
+        document = read_doc()
+        request = drop_dead_request(document)
+        state = native_state()
+        if request is not None:
+            stop_locked(document, request, state, False)
+            return 0
+        if state in ACTIVE:
+            stop_locked(document, None, state, False)
+            return 0
+        queued = start_request_locked(document, state)
+    if queued is not None:
+        print("dictation queued; wait for the mic indicator before speaking")
+        notify("dictation queued", "voxtype is transcribing. wait for the mic indicator before speaking.")
+        return wait_for_idle(queued)
+    return 0
+
+
+def configure() -> int:
+    result = native("config", "set", "audio.max_duration_secs", "3600")
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    print("max recording duration set to 3600 seconds; restart voxtype to apply it")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="voxtype-long")
+    parser.add_argument("action", choices=("start", "stop", "toggle", "cancel", "configure"))
+    args = parser.parse_args(argv)
+    try:
+        if args.action == "start":
+            return new_start()
+        if args.action == "stop":
+            return stop()
+        if args.action == "toggle":
+            return toggle()
+        if args.action == "cancel":
+            return stop(cancel=True)
+        return configure()
+    except Error as exc:
+        print(f"voxtype-long: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
