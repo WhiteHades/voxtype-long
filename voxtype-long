@@ -27,7 +27,10 @@ class Error(RuntimeError):
 
 
 def runtime() -> Path:
-    return Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+    directory = os.environ.get("XDG_RUNTIME_DIR")
+    if not directory:
+        raise Error("XDG_RUNTIME_DIR is missing; run dictation from your desktop session")
+    return Path(directory)
 
 
 def helper_dir() -> Path:

@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 
-root = Path(os.environ["XDG_RUNTIME_DIR"])
+root = Path(os.environ.get("FAKE_ROOT") or os.environ["XDG_RUNTIME_DIR"])
 state = root / "voxtype" / "state"
 log = root / "calls.log"
 state.parent.mkdir(parents=True, exist_ok=True)
@@ -78,6 +78,7 @@ class VoxtypeLongTests(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.update(
             XDG_RUNTIME_DIR=str(self.root),
+            FAKE_ROOT=str(self.root),
             VOXTYPE_LONG_NATIVE=str(self.fake),
             VOXTYPE_LONG_NOTIFY="0",
             PYTHONUNBUFFERED="1",
@@ -128,6 +129,31 @@ class VoxtypeLongTests(unittest.TestCase):
         stdout, stderr = process.communicate(timeout=3)
         self.assertEqual(process.returncode, 0, stderr)
         return stdout, stderr
+
+    def test_missing_runtime_does_not_start_native_recording(self):
+        env = self.env.copy()
+        env.pop("XDG_RUNTIME_DIR")
+        for action in ("start", "stop", "toggle", "cancel"):
+            with self.subTest(action=action):
+                result = subprocess.run(
+                    [sys.executable, str(SCRIPT), action],
+                    env=env, capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("XDG_RUNTIME_DIR", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertIsNone(self.request())
+
+    def test_configure_does_not_require_runtime(self):
+        env = self.env.copy()
+        env.pop("XDG_RUNTIME_DIR")
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "configure"],
+            env=env, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.calls(), ["config audio.max_duration_secs 3600"])
+        self.assertIsNone(self.request())
 
     def test_busy_start_is_retried_after_transcription(self):
         (self.root / "voxtype" / "state").write_text("transcribing")
